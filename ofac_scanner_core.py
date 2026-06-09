@@ -28,10 +28,10 @@ SCRIPT_PATH = os.path.abspath(__file__)
 
 COMPANY_HEADERS_PATH = os.environ.get(
     "OFAC_HEADERS_PATH",
-    r"C:\Users\s0055198\OneDrive - RGA Reinsurance Company\Documents\OFAC CODE\header")
+    r"K:\Reporting\OFAC\OFAC\header")
 BASE_OUTPUT_FOLDER = os.environ.get(
     "OFAC_OUTPUT_FOLDER",
-    r"C:\Users\s0055198\OneDrive - RGA Reinsurance Company\Documents\OFAC CODE\output")
+    r"K:\Reporting\OFAC\OFAC\Output")
 SEVEN_ZIP_PATH = os.environ.get(
     "SEVEN_ZIP_PATH", r"C:\Program Files\7-zip\7z.exe")
 
