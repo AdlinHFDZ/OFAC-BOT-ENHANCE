@@ -1,0 +1,12 @@
+ttkbootstrap>=1.10.0
+watchdog>=3.0.0
+pywin32>=306
+tkcalendar>=1.6.1
+polars>=0.20.0
+msoffcrypto-tool>=5.0.0
+chardet>=5.0.0
+clevercsv>=0.7.0
+python-dateutil>=2.8.2
+openpyxl>=3.0.0
+fastexcel>=0.12.0
+xlsxwriter>=3.0.0
