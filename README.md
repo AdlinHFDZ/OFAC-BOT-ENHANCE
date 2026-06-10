@@ -1,8 +1,7 @@
 to run this code first you must change the environment path to your local file
 
 SETUP PROJECT FOLDER
-create a folder name "OFAC CODE"
-put all the python code in the folder
+create a folder name "OFAC CODE" \put all the python code in the folder
 create one "input" folder
 put the header folder in the project folder(you can get the header folder here K:\Reporting\OFAC\OFAC
 put the company password csv file inside the project folder
