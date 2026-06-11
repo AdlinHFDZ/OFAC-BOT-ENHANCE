@@ -1,6 +1,9 @@
 """
-OFAC Scanner GUI - Enhanced Version (with Header Extraction Tab)
-Requires: ttkbootstrap, polars (optional for history), ofac_scanner_core, header_extractor_core
+OFAC Scanner GUI - Enhanced Version
+- Determinate progress bar (File X of Y)
+- Open Output Folder prompt after completion
+- All four tabs: Scan, Extract Headers, History, Settings
+- Searchable company combobox, sync between tabs, manual/optional auto-refresh
 """
 
 import tkinter as tk
@@ -44,7 +47,6 @@ from header_extractor_core import (
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ofac_settings.json")
 set_settings_file(SETTINGS_FILE)
 
-# ---------- GUI Titles ----------
 SETUP_WINDOW_TITLE = "OFAC Scanner Setup"
 SCANNER_WINDOW_TITLE = "OFAC Scanner - Enhanced"
 
@@ -119,13 +121,14 @@ class SetupGUI:
         self.main_frame.destroy()
         EnhancedScannerGUI(self.root, folder_path=folder, csv_path=csv_path)
 
+
 # ==================== MAIN SCANNER GUI ====================
 class EnhancedScannerGUI:
     def __init__(self, root, folder_path=None, csv_path=None):
         self.root = root
         self.root.title(SCANNER_WINDOW_TITLE)
         try:
-            self.root.state('zoomed')
+            self.root.state('zoomed')   # Windows
         except:
             self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}")
         self.root.minsize(800, 600)
@@ -150,6 +153,10 @@ class EnhancedScannerGUI:
         self.stop_requested = False
         self.selected_files_set = set()
         self.ext_selected_files_set = set()
+
+        # Shared company code variable for synchronization
+        self.current_company_code = tk.StringVar()
+        self.current_company_code.trace('w', self.on_company_code_changed)
 
         self.notebook = tb.Notebook(self.root)
         self.notebook.pack(fill=BOTH, expand=YES, padx=10, pady=10)
@@ -184,7 +191,8 @@ class EnhancedScannerGUI:
 
         self.refresh_file_list()
         self.refresh_extract_file_list()
-        self.root.after(2000, self.auto_refresh)
+        # Start auto-refresh loop (will check checkbox)
+        self.root.after(1000, self._auto_refresh_loop)
 
     # ---------- CSV loading ----------
     def load_csv(self):
@@ -227,7 +235,93 @@ class EnhancedScannerGUI:
         except:
             pass
 
-    # ==================== SCAN TAB ====================
+    # ---------- Searchable combobox factory ----------
+    def create_searchable_combobox(self, parent, label_text, values, variable):
+        """Returns a frame containing a label, entry, and listbox for searchable dropdown."""
+        frame = tb.Frame(parent)
+        tb.Label(frame, text=label_text).pack(side=tk.LEFT, padx=5)
+
+        entry_var = tk.StringVar()
+        entry = tb.Entry(frame, textvariable=entry_var, bootstyle="info")
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # Listbox popup (initially hidden)
+        listbox_frame = tb.Frame(parent, bootstyle="light")
+        listbox = tk.Listbox(listbox_frame, height=6, exportselection=False)
+        scrollbar = tb.Scrollbar(listbox_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        listbox_frame.pack_forget()
+
+        # Store values list for dynamic updates
+        frame.values = list(values)
+
+        def update_listbox(event=None):
+            search_term = entry_var.get().strip().lower()
+            filtered = [v for v in frame.values if search_term in v.lower()] if search_term else frame.values
+            listbox.delete(0, tk.END)
+            for item in filtered:
+                listbox.insert(tk.END, item)
+            if filtered:
+                listbox.selection_set(0)
+                listbox.see(0)
+            # Show/hide listbox only if entry has focus and there are items
+            if filtered and entry.focus_get() == entry:
+                # Place listbox_frame below the frame
+                listbox_frame.pack(fill=tk.X, pady=(0,5))
+            else:
+                listbox_frame.pack_forget()
+
+        def on_entry_focus_in(event):
+            update_listbox()
+
+        def on_entry_focus_out(event):
+            self.root.after(200, lambda: listbox_frame.pack_forget() if listbox.focus_get() != listbox else None)
+
+        def on_listbox_select(event):
+            if listbox.curselection():
+                selected = listbox.get(listbox.curselection()[0])
+                entry_var.set(selected)
+                variable.set(selected)
+                listbox_frame.pack_forget()
+
+        entry.bind("<KeyRelease>", update_listbox)
+        entry.bind("<FocusIn>", on_entry_focus_in)
+        entry.bind("<FocusOut>", on_entry_focus_out)
+        listbox.bind("<<ListboxSelect>>", on_listbox_select)
+        listbox.bind("<FocusOut>", lambda e: self.root.after(200, listbox_frame.pack_forget))
+
+        # Store references for later updates
+        frame.entry = entry
+        frame.entry_var = entry_var
+        frame.listbox_frame = listbox_frame
+        frame.listbox = listbox
+        return frame
+
+    def update_searchable_combobox_values(self, combobox_frame, new_values):
+        """Update the internal values list of a searchable combobox and refresh display."""
+        combobox_frame.values = list(new_values)
+        # Trigger update on the entry (clears filter)
+        combobox_frame.entry_var.set("")
+        combobox_frame.entry.event_generate('<KeyRelease>')
+
+    # ---------- Company code sync ----------
+    def on_company_code_changed(self, *args):
+        """Sync company code between tabs."""
+        code = self.current_company_code.get()
+        # Update the underlying StringVars used by password selection
+        if hasattr(self, 'code_var'):
+            self.code_var.set(code)
+        if hasattr(self, 'ext_code_var'):
+            self.ext_code_var.set(code)
+        # Refresh password lists
+        if hasattr(self, 'update_password_options'):
+            self.update_password_options()
+        if hasattr(self, 'ext_update_password_options'):
+            self.ext_update_password_options()
+
+    # ---------- Build Scan Tab ----------
     def build_scan_tab(self):
         canvas = tk.Canvas(self.scan_tab, highlightthickness=0)
         scrollbar = tb.Scrollbar(self.scan_tab, orient="vertical", command=canvas.yview)
@@ -250,6 +344,7 @@ class EnhancedScannerGUI:
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         canvas.bind_all("<MouseWheel>", on_mousewheel, add="+")
 
+        # File Filters
         filter_frame = tb.LabelFrame(content_frame, text="File Filters")
         filter_frame.pack(fill=X, padx=10, pady=(5, 2))
         self.filter_excel = tk.BooleanVar(value=True)
@@ -263,9 +358,14 @@ class EnhancedScannerGUI:
                        variable=self.filter_csv, bootstyle="primary").pack(anchor="w", pady=1)
         tb.Checkbutton(cb_frame, text="Archives (.zip, .7z, .rar, .tar)",
                        variable=self.filter_archive, bootstyle="primary").pack(anchor="w", pady=1)
-        tb.Button(filter_frame, text="Refresh List", command=self.refresh_file_list,
-                  bootstyle="secondary").pack(pady=5, anchor="w")
 
+        btn_frame = tb.Frame(filter_frame)
+        btn_frame.pack(fill=X, pady=5)
+        tb.Button(btn_frame, text="Refresh List", command=self.refresh_file_list, bootstyle="secondary").pack(side=tk.LEFT, padx=5)
+        self.auto_refresh_var = tk.BooleanVar(value=False)
+        tb.Checkbutton(btn_frame, text="Auto-refresh every 2 sec", variable=self.auto_refresh_var, bootstyle="primary").pack(side=tk.LEFT, padx=10)
+
+        # File List
         list_frame = tb.LabelFrame(content_frame, text="Files in Watch Folder")
         list_frame.pack(fill=BOTH, expand=YES, padx=10, pady=2)
         self.file_canvas = tk.Canvas(list_frame, highlightthickness=0)
@@ -286,18 +386,24 @@ class EnhancedScannerGUI:
         tb.Button(select_frame, text="Clear All", command=self.clear_selection_checkbox,
                   bootstyle="secondary").pack(side=LEFT, padx=5)
 
+        # Scan Configuration
         config_frame = tb.LabelFrame(content_frame, text="Scan Configuration")
         config_frame.pack(fill=X, padx=10, pady=2)
 
         row1 = tb.Frame(config_frame)
         row1.pack(fill=X, padx=5, pady=(5, 2))
-        tb.Label(row1, text="Company Code:").pack(side=LEFT, padx=5)
+        # Searchable company combobox
+        company_codes = sorted(set([d['Code'] for d in self.company_data]))
+        self.searchable_company_scan = self.create_searchable_combobox(
+            row1, "Company Code:", company_codes, self.current_company_code
+        )
+        self.searchable_company_scan.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        tb.Button(row1, text="+ New Code", command=self.add_new_code, bootstyle="success").pack(side=tk.LEFT, padx=5)
+
+        # For backward compatibility with password methods, keep code_var
         self.code_var = tk.StringVar()
-        self.code_combo = tb.Combobox(row1, textvariable=self.code_var, bootstyle="primary")
-        self.code_combo['values'] = sorted(set([d['Code'] for d in self.company_data]))
-        self.code_combo.pack(side=LEFT, fill=X, expand=YES, padx=5)
-        self.code_combo.bind('<<ComboboxSelected>>', self.update_password_options)
-        tb.Button(row1, text="+ New Code", command=self.add_new_code, bootstyle="success").pack(side=LEFT, padx=5)
+        self.current_company_code.trace('w', lambda *a: self.code_var.set(self.current_company_code.get()))
+        self.code_var.set(self.current_company_code.get())
 
         pass_frame = tb.LabelFrame(config_frame, text="Passwords")
         pass_frame.pack(fill=BOTH, expand=YES, padx=5, pady=2)
@@ -325,12 +431,13 @@ class EnhancedScannerGUI:
         self.pass_vars = {}
         self.all_passwords = []
 
-        btn_frame = tb.Frame(pass_frame)
-        btn_frame.pack(fill=X, pady=2)
-        tb.Button(btn_frame, text="Select All", command=self.select_all_passwords, bootstyle="info").pack(side=LEFT, padx=5)
-        tb.Button(btn_frame, text="Clear All", command=self.clear_all_passwords, bootstyle="secondary").pack(side=LEFT, padx=5)
-        tb.Button(btn_frame, text="+ New Password", command=self.add_new_pass, bootstyle="success").pack(side=RIGHT, padx=5)
+        btn_frame2 = tb.Frame(pass_frame)
+        btn_frame2.pack(fill=X, pady=2)
+        tb.Button(btn_frame2, text="Select All", command=self.select_all_passwords, bootstyle="info").pack(side=LEFT, padx=5)
+        tb.Button(btn_frame2, text="Clear All", command=self.clear_all_passwords, bootstyle="secondary").pack(side=LEFT, padx=5)
+        tb.Button(btn_frame2, text="+ New Password", command=self.add_new_pass, bootstyle="success").pack(side=RIGHT, padx=5)
 
+        # Date picker
         row3 = tb.Frame(config_frame)
         row3.pack(fill=X, padx=5, pady=(5, 5))
         tb.Label(row3, text="Email Received Date:").pack(side=LEFT, padx=5)
@@ -343,6 +450,7 @@ class EnhancedScannerGUI:
             self.date_entry.insert(0, date.today().isoformat())
         self.date_entry.pack(side=LEFT, padx=5)
 
+        # Action Buttons
         action_frame = tb.Frame(content_frame)
         action_frame.pack(fill=X, padx=10, pady=(5, 10))
         tb.Button(action_frame, text="Queue for Watcher", command=self.queue_for_watcher,
@@ -353,6 +461,7 @@ class EnhancedScannerGUI:
                                   bootstyle="danger", width=20, state=DISABLED)
         self.stop_btn.pack(side=LEFT, padx=5)
 
+        # Log Output
         log_frame = tb.LabelFrame(content_frame, text="Log Output")
         log_frame.pack(fill=BOTH, expand=YES, padx=10, pady=(5, 10))
         log_frame.grid_rowconfigure(0, weight=1)
@@ -360,7 +469,7 @@ class EnhancedScannerGUI:
         self.log_text = ScrolledText(log_frame, height=8, wrap=WORD)
         self.log_text.pack(fill=BOTH, expand=YES)
 
-    # ==================== EXTRACT HEADERS TAB ====================
+    # ---------- Build Extract Headers Tab ----------
     def build_extract_headers_tab(self):
         canvas = tk.Canvas(self.extract_tab, highlightthickness=0)
         scrollbar = tb.Scrollbar(self.extract_tab, orient="vertical", command=canvas.yview)
@@ -383,6 +492,7 @@ class EnhancedScannerGUI:
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         canvas.bind_all("<MouseWheel>", on_mousewheel, add="+")
 
+        # File Filters
         filter_frame = tb.LabelFrame(content_frame, text="File Filters")
         filter_frame.pack(fill=X, padx=10, pady=(5, 2))
         self.ext_filter_excel = tk.BooleanVar(value=True)
@@ -396,9 +506,13 @@ class EnhancedScannerGUI:
                        variable=self.ext_filter_csv, bootstyle="primary").pack(anchor="w", pady=1)
         tb.Checkbutton(cb_frame, text="Archives (.zip, .7z, .rar, .tar)",
                        variable=self.ext_filter_archive, bootstyle="primary").pack(anchor="w", pady=1)
-        tb.Button(filter_frame, text="Refresh List", command=self.refresh_extract_file_list,
-                  bootstyle="secondary").pack(pady=5, anchor="w")
 
+        btn_frame = tb.Frame(filter_frame)
+        btn_frame.pack(fill=X, pady=5)
+        tb.Button(btn_frame, text="Refresh List", command=self.refresh_extract_file_list, bootstyle="secondary").pack(side=tk.LEFT, padx=5)
+        # Auto-refresh checkbox already present; no need for another one here
+
+        # File List
         list_frame = tb.LabelFrame(content_frame, text="Files in Watch Folder")
         list_frame.pack(fill=BOTH, expand=YES, padx=10, pady=2)
         self.ext_file_canvas = tk.Canvas(list_frame, highlightthickness=0)
@@ -419,18 +533,23 @@ class EnhancedScannerGUI:
         tb.Button(select_frame, text="Clear All", command=self.ext_clear_all_files,
                   bootstyle="secondary").pack(side=LEFT, padx=5)
 
+        # Configuration
         config_frame = tb.LabelFrame(content_frame, text="Extraction Configuration")
         config_frame.pack(fill=X, padx=10, pady=2)
 
         row1 = tb.Frame(config_frame)
         row1.pack(fill=X, padx=5, pady=(5, 2))
-        tb.Label(row1, text="Company Code:").pack(side=LEFT, padx=5)
+        # Searchable company combobox for extract tab
+        company_codes = sorted(set([d['Code'] for d in self.company_data]))
+        self.searchable_company_extract = self.create_searchable_combobox(
+            row1, "Company Code:", company_codes, self.current_company_code
+        )
+        self.searchable_company_extract.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        tb.Button(row1, text="+ New Code", command=self.add_new_code, bootstyle="success").pack(side=tk.LEFT, padx=5)
+
         self.ext_code_var = tk.StringVar()
-        self.ext_code_combo = tb.Combobox(row1, textvariable=self.ext_code_var, bootstyle="primary")
-        self.ext_code_combo['values'] = sorted(set([d['Code'] for d in self.company_data]))
-        self.ext_code_combo.pack(side=LEFT, fill=X, expand=YES, padx=5)
-        self.ext_code_combo.bind('<<ComboboxSelected>>', self.ext_update_password_options)
-        tb.Button(row1, text="+ New Code", command=self.add_new_code, bootstyle="success").pack(side=LEFT, padx=5)
+        self.current_company_code.trace('w', lambda *a: self.ext_code_var.set(self.current_company_code.get()))
+        self.ext_code_var.set(self.current_company_code.get())
 
         pass_frame = tb.LabelFrame(config_frame, text="Passwords")
         pass_frame.pack(fill=BOTH, expand=YES, padx=5, pady=2)
@@ -456,11 +575,11 @@ class EnhancedScannerGUI:
         self.ext_pass_vars = {}
         self.ext_all_passwords = []
 
-        btn_frame = tb.Frame(pass_frame)
-        btn_frame.pack(fill=X, pady=2)
-        tb.Button(btn_frame, text="Select All", command=self.ext_select_all_passwords, bootstyle="info").pack(side=LEFT, padx=5)
-        tb.Button(btn_frame, text="Clear All", command=self.ext_clear_all_passwords, bootstyle="secondary").pack(side=LEFT, padx=5)
-        tb.Button(btn_frame, text="+ New Password", command=self.add_new_pass, bootstyle="success").pack(side=RIGHT, padx=5)
+        btn_frame2 = tb.Frame(pass_frame)
+        btn_frame2.pack(fill=X, pady=2)
+        tb.Button(btn_frame2, text="Select All", command=self.ext_select_all_passwords, bootstyle="info").pack(side=LEFT, padx=5)
+        tb.Button(btn_frame2, text="Clear All", command=self.ext_clear_all_passwords, bootstyle="secondary").pack(side=LEFT, padx=5)
+        tb.Button(btn_frame2, text="+ New Password", command=self.add_new_pass, bootstyle="success").pack(side=RIGHT, padx=5)
 
         row3 = tb.Frame(config_frame)
         row3.pack(fill=X, padx=5, pady=(5, 5))
@@ -486,7 +605,7 @@ class EnhancedScannerGUI:
         self.ext_log_text = ScrolledText(log_frame, height=8, wrap=WORD)
         self.ext_log_text.pack(fill=BOTH, expand=YES)
 
-    # ==================== HISTORY TAB ====================
+    # ---------- History Tab ----------
     def build_history_tab(self):
         frame = tb.Frame(self.history_tab)
         frame.pack(fill=BOTH, expand=YES, padx=10, pady=10)
@@ -502,7 +621,7 @@ class EnhancedScannerGUI:
         scroll.pack(side=RIGHT, fill=Y)
         self.history_tree.configure(yscrollcommand=scroll.set)
 
-    # ==================== SETTINGS TAB ====================
+    # ---------- Settings Tab ----------
     def build_settings_tab(self):
         frame = tb.Frame(self.settings_tab)
         frame.pack(fill=BOTH, expand=YES, padx=20, pady=20)
@@ -528,7 +647,7 @@ class EnhancedScannerGUI:
         tb.Button(csv_frame, text="Change", command=self.change_csv_file, bootstyle="warning").pack(side=RIGHT)
         tb.Button(frame, text="Save Settings", command=self.save_settings, bootstyle="success").pack(pady=20)
 
-    # ---------- Common file list refresh ----------
+    # ---------- File list refresh for Scan tab ----------
     def refresh_file_list(self):
         if not self.folder_path:
             return
@@ -565,6 +684,7 @@ class EnhancedScannerGUI:
         except Exception as e:
             self.log(f"Refresh error: {e}")
 
+    # ---------- File list refresh for Extract tab ----------
     def refresh_extract_file_list(self):
         if not self.folder_path:
             return
@@ -602,15 +722,30 @@ class EnhancedScannerGUI:
             self.ext_log(f"Refresh error: {e}")
 
     # ---------- Scan tab selections ----------
-    def select_all_files_checkbox(self):
-        for var in self.file_vars.values():
-            var.set(1)
-    def clear_selection_checkbox(self):
-        for var in self.file_vars.values():
-            var.set(0)
     def get_selected_files(self):
         return [fname for fname, var in self.file_vars.items() if var.get() == 1]
 
+    def select_all_files_checkbox(self):
+        for var in self.file_vars.values():
+            var.set(1)
+
+    def clear_selection_checkbox(self):
+        for var in self.file_vars.values():
+            var.set(0)
+
+    # ---------- Extract tab selections ----------
+    def ext_get_selected_files(self):
+        return [fname for fname, var in self.ext_file_vars.items() if var.get() == 1]
+
+    def ext_select_all_files(self):
+        for var in self.ext_file_vars.values():
+            var.set(1)
+
+    def ext_clear_all_files(self):
+        for var in self.ext_file_vars.values():
+            var.set(0)
+
+    # ---------- Password handling for Scan tab ----------
     def update_password_options(self, event=None):
         selected = self.code_var.get()
         self.all_passwords = [d['Password'] for d in self.company_data if d['Code'] == selected]
@@ -639,22 +774,15 @@ class EnhancedScannerGUI:
     def select_all_passwords(self):
         for var in self.pass_vars.values():
             var.set(1)
+
     def clear_all_passwords(self):
         for var in self.pass_vars.values():
             var.set(0)
+
     def get_selected_passwords(self):
         return [pwd for pwd, var in self.pass_vars.items() if var.get() == 1]
 
-    # ---------- Extract tab selections ----------
-    def ext_select_all_files(self):
-        for var in self.ext_file_vars.values():
-            var.set(1)
-    def ext_clear_all_files(self):
-        for var in self.ext_file_vars.values():
-            var.set(0)
-    def ext_get_selected_files(self):
-        return [fname for fname, var in self.ext_file_vars.items() if var.get() == 1]
-
+    # ---------- Password handling for Extract tab ----------
     def ext_update_password_options(self, event=None):
         selected = self.ext_code_var.get()
         self.ext_all_passwords = [d['Password'] for d in self.company_data if d['Code'] == selected]
@@ -683,9 +811,11 @@ class EnhancedScannerGUI:
     def ext_select_all_passwords(self):
         for var in self.ext_pass_vars.values():
             var.set(1)
+
     def ext_clear_all_passwords(self):
         for var in self.ext_pass_vars.values():
             var.set(0)
+
     def ext_get_selected_passwords(self):
         return [pwd for pwd, var in self.ext_pass_vars.items() if var.get() == 1]
 
@@ -703,7 +833,7 @@ class EnhancedScannerGUI:
             except:
                 return date.today().strftime("%m%d%Y")
 
-    # ---------- New Code / New Password dialogs ----------
+    # ---------- Dialogs ----------
     def add_new_code(self):
         dialog = tb.Toplevel(self.root)
         dialog.title("New Company Code")
@@ -722,11 +852,12 @@ class EnhancedScannerGUI:
                 new_row = {'Code': code, 'Password': pwd}
                 self.company_data.append(new_row)
                 self.append_csv(new_row)
-                self.code_combo['values'] = sorted(set([d['Code'] for d in self.company_data]))
-                self.code_combo.set(code)
-                self.ext_code_combo['values'] = self.code_combo['values']
-                self.update_password_options()
-                self.ext_update_password_options()
+                # Update company dropdown values
+                new_codes = sorted(set([d['Code'] for d in self.company_data]))
+                self.update_searchable_combobox_values(self.searchable_company_scan, new_codes)
+                self.update_searchable_combobox_values(self.searchable_company_extract, new_codes)
+                # Set the new code as current
+                self.current_company_code.set(code)
                 dialog.destroy()
             else:
                 messagebox.showwarning("Warning", "Both fields required")
@@ -736,21 +867,21 @@ class EnhancedScannerGUI:
         self.root.wait_window(dialog)
 
     def add_new_pass(self):
-        selected = self.code_var.get() or self.ext_code_var.get()
-        if not selected:
+        code = self.current_company_code.get()
+        if not code:
             messagebox.showwarning("Warning", "Select a company code first.")
             return
         dialog = tb.Toplevel(self.root)
         dialog.title("New Password")
         dialog.geometry("300x150")
         dialog.attributes('-topmost', True)
-        tb.Label(dialog, text=f"New password for {selected}:").pack(pady=5)
+        tb.Label(dialog, text=f"New password for {code}:").pack(pady=5)
         pwd_entry = tb.Entry(dialog)
         pwd_entry.pack(pady=5)
         def save():
             pwd = pwd_entry.get().strip()
             if pwd:
-                new_row = {'Code': selected, 'Password': pwd}
+                new_row = {'Code': code, 'Password': pwd}
                 self.company_data.append(new_row)
                 self.append_csv(new_row)
                 self.update_password_options()
@@ -799,23 +930,30 @@ class EnhancedScannerGUI:
             messagebox.showerror("Error", "Select company and at least one password")
             return
         email_received_date = self.get_email_date()
+
         self.stop_btn.config(state=NORMAL)
-        self.progress.pack(side=BOTTOM, fill=X, padx=10, pady=5)
-        self.progress.start()
-        self.status_var.set("Scanning...")
         self.stop_requested = False
+        total_files = len(files)
+
+        self.progress.configure(mode="determinate", maximum=total_files, value=0)
+        self.progress.pack(side=BOTTOM, fill=X, padx=10, pady=5)
+        self.status_var.set("Scanning...")
 
         def stop_flag():
             return self.stop_requested
+
+        def progress_update(current, total):
+            self.root.after(0, lambda: self._update_progress(current, total))
 
         def scan():
             try:
                 job = ScannerJob(self.folder_path, code, passwords, email_received_date, files)
                 def log_callback(msg):
                     self.root.after(0, lambda: self.log(msg))
-                process_files_direct(job, progress_callback=log_callback, stop_flag=stop_flag)
+                process_files_direct(job, progress_callback=log_callback,
+                                     stop_flag=stop_flag, progress_update=progress_update)
                 self.root.after(0, lambda: self.log("Scanning completed!"))
-                self.root.after(0, lambda: messagebox.showinfo("Done", f"Output saved to {job.output_root}"))
+                self.root.after(0, lambda: self._ask_open_output_folder(job.output_root))
             except Exception as e:
                 self.root.after(0, lambda: self.log(f"Error: {e}"))
                 self.root.after(0, lambda: messagebox.showerror("Scanner Error", str(e)))
@@ -824,6 +962,14 @@ class EnhancedScannerGUI:
 
         self.scan_thread = threading.Thread(target=scan, daemon=True)
         self.scan_thread.start()
+
+    def _update_progress(self, current, total):
+        self.progress['value'] = current
+        self.status_var.set(f"Processing file {current} of {total}")
+
+    def _ask_open_output_folder(self, output_root):
+        if messagebox.askyesno("Done", f"Output saved to:\n{output_root}\n\nOpen folder?"):
+            os.startfile(output_root)
 
     def stop_scan(self):
         self.stop_requested = True
@@ -849,7 +995,6 @@ class EnhancedScannerGUI:
             return
 
         date_str = self.ext_get_date()
-
         job = HeaderExtractionJob(
             input_folder=self.folder_path,
             company_code=code,
@@ -858,18 +1003,23 @@ class EnhancedScannerGUI:
             file_names=files
         )
 
+        total_files = len(files)
+        self.progress.configure(mode="determinate", maximum=total_files, value=0)
         self.progress.pack(side=BOTTOM, fill=X, padx=10, pady=5)
-        self.progress.start()
         self.status_var.set("Extracting headers...")
         self.ext_log("Header extraction started...")
+
+        def progress_update(current, total):
+            self.root.after(0, lambda: self._update_progress(current, total))
 
         def task():
             try:
                 def log_callback(msg):
                     self.root.after(0, lambda: self.ext_log(msg))
-                process_header_extraction(job, progress_callback=log_callback)
+                process_header_extraction(job, progress_callback=log_callback,
+                                          progress_update=progress_update)
                 self.root.after(0, lambda: self.ext_log(f"Extraction complete. Output: {job.header_output_file}"))
-                self.root.after(0, lambda: messagebox.showinfo("Done", f"Headers saved to:\n{job.header_output_file}"))
+                self.root.after(0, lambda: self._ask_open_output_folder(os.path.dirname(job.header_output_file)))
             except Exception as e:
                 self.root.after(0, lambda: self.ext_log(f"Error: {e}"))
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -909,10 +1059,13 @@ class EnhancedScannerGUI:
             except:
                 return date.today().strftime("%Y-%m-%d")
 
-    def auto_refresh(self):
-        self.refresh_file_list()
-        self.refresh_extract_file_list()
-        self.root.after(2000, self.auto_refresh)
+    # ---------- Auto-refresh loop (conditional) ----------
+    def _auto_refresh_loop(self):
+        """If auto-refresh is enabled, refresh file lists every 2 seconds."""
+        if self.auto_refresh_var.get():
+            self.refresh_file_list()
+            self.refresh_extract_file_list()
+        self.root.after(2000, self._auto_refresh_loop)
 
     # ---------- History ----------
     def load_history(self):
@@ -966,9 +1119,11 @@ class EnhancedScannerGUI:
         self.folder_path = self.watch_path_var.get()
         self.csv_path = self.csv_path_var.get()
         self.company_data = self.load_csv()
-        self.code_combo['values'] = sorted(set([d['Code'] for d in self.company_data]))
-        self.ext_code_combo['values'] = self.code_combo['values']
+        new_codes = sorted(set([d['Code'] for d in self.company_data]))
+        self.update_searchable_combobox_values(self.searchable_company_scan, new_codes)
+        self.update_searchable_combobox_values(self.searchable_company_extract, new_codes)
         messagebox.showinfo("Settings", "Settings saved. Restart the application for full effect.")
+
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
