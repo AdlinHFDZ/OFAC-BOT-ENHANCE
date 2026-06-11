@@ -158,7 +158,7 @@ class ScannerJob:
         # Convert GUI date (YYYY-MM-DD) to YYYYDDMM for folder/file naming
         try:
             dt = datetime.strptime(email_received_date, "%Y-%m-%d")
-            self.date_display = dt.strftime("%Y%d%m")   # YYYYDDMM
+            self.date_display = dt.strftime("%Y%m%d")   # YYYYDDMM
         except:
             # fallback: use as‑is with dashes removed
             self.date_display = email_received_date.replace("-", "")
