@@ -30,6 +30,6 @@ HOW TO RUN (can be use even if python not installed directly in your local)
 8. the filepath will have (.venv) at the front -- if everything okay you are doing well so far
 9. copy and paste this in the terminal (you will see the library updating and download the requirement) -->    pip install -r requirements.txt
 11. if everything is okay try to run it --> py ofac_gui.py
-12. if not okay, idk la TT. jk just reach out to Jia Ming :)
+12. if not okay, idk la TT. jk just reach out to JM :)
     
 
