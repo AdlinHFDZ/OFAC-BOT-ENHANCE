@@ -1,20 +1,19 @@
 # ofac_scanner_core.py
 """
-OFAC Scanner Core – fully fixed with:
-- no age‑based discarding (minors kept)
-- missing‑name counting
-- CSV splitting for very large outputs
-- content‑based column detection
-- detailed debug logging
-- output folder and log file named with YYYYDDMM format
-- BUGFIX: large text file slicing – no rows lost after first chunk
-- NEW: multiple‑table detection in a single Excel sheet (via column clusters)
-- NEW: numeric column filter – numeric IDs are no longer treated as names
-- FIX: column renaming before numeric filter so name columns work correctly
-  (all original multi‑name, shift‑adjustment, etc. preserved)
+OFAC Scanner Core – FIXED + IMPROVED
+Fixes included:
+- [EARLIER] clean_string_expr removes digits & collapses spaces
+- [EARLIER] output folder isolated per company under date: <date>/<company_code>
+- [EARLIER] safety net: if COMPLETE_NAME still has digits, use SURNAME+FIRST_NAME
+- [PATCH 1] Large text file batching: all chunks now use the same renamed column names
+- [PATCH 2] Multi‑name handling unified: Excel now uses build_output_df (like text files)
+- [PATCH 4] Content‑based fallback for text files when no header is found
+- [PATCH 6] Files moved to archive only after successful processing
+- [PATCH 8] Cross‑file deduplication in compiled Excel output
+- [PATCH 10] Better error logging with exception type and traceback
 """
 
-import os, sys, csv, json, subprocess, time, shutil, re, io, difflib
+import os, sys, csv, json, subprocess, time, shutil, re, io, difflib, traceback
 from datetime import datetime
 from ctypes import WinDLL
 
@@ -31,7 +30,6 @@ ENV_VAR_FOLDER = "OFAC_INPUT_FOLDER"
 ENV_VAR_CSV = "OFAC_COMPANY_PASSWORD_CSV"
 APP_NAME = "OFAC_Scanner_GUI"
 SCRIPT_PATH = os.path.abspath(__file__)
-
 
 COMPANY_HEADERS_PATH = os.environ.get(
     "OFAC_HEADERS_PATH",
@@ -52,7 +50,6 @@ CHUNK_SIZE = 10000
 MAX_SEARCH_ROWS = 50
 EXCEL_ROW_CHUNK = 50000
 
-# Max rows per single output CSV before splitting (0 = no splitting)
 MAX_ROWS_PER_OUTPUT_CSV = 500_000
 
 OUTPUT_COLUMNS = ["SURNAME", "FIRST_NAME", "COMPLETE_NAME", "SEX", "DATE_OF_BIRTH",
@@ -150,21 +147,20 @@ class ScannerJob:
         self.input_folder = input_folder
         self.company_code = company_code
         self.passwords = passwords
-        self.email_received_date = email_received_date   # original YYYY-MM-DD
+        self.email_received_date = email_received_date
         self.file_names = file_names
         self.email = email
         self.today = datetime.now().strftime("%Y%m%d")
 
-        # Convert GUI date (YYYY-MM-DD) to YYYYDDMM for folder/file naming
         try:
             dt = datetime.strptime(email_received_date, "%Y-%m-%d")
-            self.date_display = dt.strftime("%Y%m%d")   # YYYYDDMM
+            self.date_display = dt.strftime("%Y%m%d")
         except:
-            # fallback: use as‑is with dashes removed
             self.date_display = email_received_date.replace("-", "")
 
-        # Output paths now use YYYYDDMM format
-        self.output_root = os.path.join(BASE_OUTPUT_FOLDER, self.date_display)
+        # [EARLIER] Output folder isolated per company inside date folder
+        self.output_root = os.path.join(BASE_OUTPUT_FOLDER, self.date_display, self.company_code)
+
         self.csv_folder = os.path.join(self.output_root, "CSVs")
         self.archived_folder = os.path.join(self.output_root, "Archived")
         self.unzipped_folder = os.path.join(self.output_root, "Unzipped")
@@ -176,10 +172,18 @@ class ScannerJob:
 
 # ==================== HEADER HELPERS ====================
 def get_company_header(company_code):
+    """
+    Load header keywords from an Excel file.
+    First tries: ...\header\by_company\header_{COMPANY_CODE}.xlsx
+    Falls back to: ...\header\header.xlsx
+    Each sheet is read in its entirety – all non‑empty, cleaned cells become keywords.
+    Returns a tuple of (header_dict, used_file_path)
+    """
     sheets = ["name", "firstlastname", "sex", "dob", "policynum"]
     company_path = os.path.join(COMPANY_HEADERS_PATH, "by_company", f"header_{company_code.upper().strip()}.xlsx")
     default_path = os.path.join(COMPANY_HEADERS_PATH, "header.xlsx")
     file_path = company_path if os.path.exists(company_path) else default_path
+
     header_dict = {}
     for sheet in sheets:
         try:
@@ -187,11 +191,28 @@ def get_company_header(company_code):
             if df.is_empty() or len(df.columns) == 0:
                 header_dict[sheet] = set()
                 continue
-            first_col = df.columns[0]
-            values = df.select(pl.col(first_col).str.strip_chars().str.to_lowercase().str.replace_all(r'[^a-z]', '')).to_series().to_list()
-            header_dict[sheet] = set(values)
-        except:
+
+            # Collect all non‑empty cells from every column, clean them
+            all_values = []
+            for col in df.columns:
+                clean_series = (
+                    df[col]
+                    .cast(pl.Utf8)                             # ensure string
+                    .str.strip_chars()                         # trim whitespace
+                    .str.to_lowercase()                        # lowercase
+                    .str.replace_all(r'[^a-z]', '')            # remove non‑alpha
+                    .drop_nulls()                              # drop None/NaN
+                )
+                all_values.extend(clean_series.to_list())
+
+            # Remove empty strings (some cells become empty after cleaning)
+            all_values = [v for v in all_values if v]
+            header_dict[sheet] = set(all_values)
+
+        except Exception:
+            # If anything fails (e.g., sheet missing, corrupt), store empty set
             header_dict[sheet] = set()
+
     return header_dict, file_path
 
 def clean_for_match(text):
@@ -231,8 +252,16 @@ def parse_date_to_mmddyyyy(value):
             continue
     return ''
 
+# [EARLIER] Strip digits & collapse spaces in name fields
 def clean_string_expr(col_name):
-    return pl.col(col_name).cast(pl.Utf8).str.strip_chars().str.replace_all(r'[^a-zA-Z0-9\s]', '').fill_null('')
+    return (
+        pl.col(col_name)
+        .cast(pl.Utf8)
+        .str.replace_all(r'[^a-zA-Z\s]', '')   # remove everything except letters and whitespace
+        .str.replace_all(r'\s+', ' ')           # collapse multiple spaces
+        .str.strip_chars()
+        .fill_null('')
+    )
 
 # --- Numeric column filter ---
 def is_column_numeric(series: pl.Series, sample_size=100, threshold=0.9) -> bool:
@@ -249,7 +278,6 @@ def filter_numeric_columns(df: pl.DataFrame, col_names, threshold=0.9):
         return col_names
     return [c for c in col_names if c in df.columns and not is_column_numeric(df[c], threshold=threshold)]
 
-# --- Duplicate filter ---
 def filter_duplicates_only(df):
     if df.is_empty():
         return df
@@ -377,7 +405,6 @@ def detect_header_row_and_columns(df_sample, company_headers):
 
 # ==================== COLUMN RENAMING HELPER ====================
 def rename_columns_with_header(df, header_row_idx):
-    """Rename columns using the header row, then return the DataFrame with that row removed."""
     raw_headers = df.row(header_row_idx)
     raw_headers = [str(h) if h is not None else '' for h in raw_headers]
     unique_headers = []
@@ -393,13 +420,12 @@ def rename_columns_with_header(df, header_row_idx):
     data_df.columns = unique_headers
     return data_df
 
-# ==================== OUTPUT BUILDERS (ORIGINAL, WITH BUGFIX) ====================
+# ==================== OUTPUT BUILDER (single unified function) ====================
 def build_output_df(df, header_row_idx, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
                     file_path, sheet_name, company_code):
-    # Use rename_columns_with_header if header_row_idx >= 0, else assume already renamed
+    # [PATCH 2] This function is now used by both Excel and text files.
     if header_row_idx >= 0:
         df = rename_columns_with_header(df, header_row_idx)
-        # now no header row
     data_df = df
     multiple_name = (len(name_cols) >= 2) or (len(firstlast_cols) > 2)
 
@@ -408,6 +434,13 @@ def build_output_df(df, header_row_idx, name_cols, firstlast_cols, sex_cols, dob
             pl.when(pl.col('COMPLETE_NAME_RAW').is_not_null() & (pl.col('COMPLETE_NAME_RAW') != ''))
             .then(pl.col('COMPLETE_NAME_RAW'))
             .otherwise(pl.concat_str([pl.col('SURNAME'), pl.col('FIRST_NAME')], separator=' ').str.strip_chars())
+            .alias('COMPLETE_NAME')
+        )
+        # [EARLIER] safety net: if COMPLETE_NAME still contains a digit, use SURNAME+FIRST_NAME
+        result = result.with_columns(
+            pl.when(pl.col('COMPLETE_NAME').str.contains(r'\d'))
+            .then(pl.concat_str([pl.col('SURNAME'), pl.col('FIRST_NAME')], separator=' ').str.strip_chars())
+            .otherwise(pl.col('COMPLETE_NAME'))
             .alias('COMPLETE_NAME')
         )
         missing_name_count = result.filter(pl.col('COMPLETE_NAME') == '').height
@@ -468,62 +501,9 @@ def build_output_df(df, header_row_idx, name_cols, firstlast_cols, sex_cols, dob
     ])
     return finalize(result)
 
-def build_output_df_safe(df, header_row_idx, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
-                         file_path, sheet_name, company_code):
-    if header_row_idx >= 0:
-        df = rename_columns_with_header(df, header_row_idx)
-    data_df = df
+# [PATCH 2] The former build_output_df_safe is removed; Excel now calls build_output_df.
 
-    sur_expr = clean_string_expr(firstlast_cols[0]) if firstlast_cols else pl.lit(None)
-    fn_expr = clean_string_expr(firstlast_cols[1]) if len(firstlast_cols) > 1 else pl.lit(None)
-    name_expr = clean_string_expr(name_cols[0]) if name_cols else pl.lit(None)
-    sex_expr = pl.col(sex_cols[0]).map_elements(normalize_sex, return_dtype=pl.Utf8) if sex_cols else pl.lit('')
-    dob_expr = pl.col(dob_cols[0]).map_elements(parse_date_to_mmddyyyy, return_dtype=pl.Utf8) if dob_cols else pl.lit('')
-
-    result = data_df.select([
-        sur_expr.alias('SURNAME'), fn_expr.alias('FIRST_NAME'), name_expr.alias('COMPLETE_NAME_RAW'),
-        sex_expr.alias('SEX'), dob_expr.alias('DATE_OF_BIRTH'), pl.lit(company_code).alias('CMPY_NO'),
-        (pl.col(pol_cols[0]) if pol_cols else pl.lit(None)).alias('POLICY_NUMBER'),
-        pl.lit(file_path).alias('FILE_PATH'), pl.lit(sheet_name).alias('SHEET')
-    ])
-    result = result.with_columns(
-        pl.when(pl.col('COMPLETE_NAME_RAW').is_not_null() & (pl.col('COMPLETE_NAME_RAW') != ''))
-        .then(pl.col('COMPLETE_NAME_RAW'))
-        .otherwise(pl.concat_str([pl.col('SURNAME'), pl.col('FIRST_NAME')], separator=' ').str.strip_chars())
-        .alias('COMPLETE_NAME')
-    )
-    missing_name_count = result.filter(pl.col('COMPLETE_NAME') == '').height
-    result = result.filter(pl.col('COMPLETE_NAME') != '')
-    return result.select(OUTPUT_COLUMNS), missing_name_count
-
-def build_output_df_safe_without_header(df, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
-                                        file_path, sheet_name, company_code):
-    # This is kept for headerless fallback; it doesn't handle multi-name,
-    # but it's only used when no header was found at all.
-    data_df = df.clone()
-    sur_expr = clean_string_expr(firstlast_cols[0]) if firstlast_cols and firstlast_cols[0] in data_df.columns else pl.lit(None)
-    fn_expr = clean_string_expr(firstlast_cols[1]) if len(firstlast_cols) > 1 and firstlast_cols[1] in data_df.columns else pl.lit(None)
-    name_expr = clean_string_expr(name_cols[0]) if name_cols and name_cols[0] in data_df.columns else pl.lit(None)
-    sex_expr = pl.col(sex_cols[0]).map_elements(normalize_sex, return_dtype=pl.Utf8) if sex_cols and sex_cols[0] in data_df.columns else pl.lit('')
-    dob_expr = pl.col(dob_cols[0]).map_elements(parse_date_to_mmddyyyy, return_dtype=pl.Utf8) if dob_cols and dob_cols[0] in data_df.columns else pl.lit('')
-    pol_expr = pl.col(pol_cols[0]) if pol_cols and pol_cols[0] in data_df.columns else pl.lit(None)
-
-    result = data_df.select([
-        sur_expr.alias('SURNAME'), fn_expr.alias('FIRST_NAME'), name_expr.alias('COMPLETE_NAME_RAW'),
-        sex_expr.alias('SEX'), dob_expr.alias('DATE_OF_BIRTH'), pl.lit(company_code).alias('CMPY_NO'),
-        pol_expr.alias('POLICY_NUMBER'),
-        pl.lit(file_path).alias('FILE_PATH'), pl.lit(sheet_name).alias('SHEET')
-    ])
-    result = result.with_columns(
-        pl.when(pl.col('COMPLETE_NAME_RAW').is_not_null() & (pl.col('COMPLETE_NAME_RAW') != ''))
-        .then(pl.col('COMPLETE_NAME_RAW'))
-        .otherwise(pl.concat_str([pl.col('SURNAME'), pl.col('FIRST_NAME')], separator=' ').str.strip_chars())
-        .alias('COMPLETE_NAME')
-    )
-    missing_name_count = result.filter(pl.col('COMPLETE_NAME') == '').height
-    return result.filter(pl.col('COMPLETE_NAME') != '').select(OUTPUT_COLUMNS), missing_name_count
-
-# ==================== EXCEL PROCESSING (ORIGINAL LOGIC, WITH FIXES) ====================
+# ==================== EXCEL PROCESSING ====================
 def process_excel_file_standard(job, file_path, file_name, company_headers, password):
     try:
         sheets = pl.read_excel(file_path if isinstance(file_path, str) else file_path,
@@ -531,10 +511,8 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
         for sheet_name, df in sheets.items():
             sample_df = df.head(min(df.height, MAX_SEARCH_ROWS))
 
-            # Multi‑table detection
             tables = detect_tables_in_sheet(sample_df, company_headers, MAX_SEARCH_ROWS)
             if not tables:
-                # Fallback to single‑table
                 tables = [{
                     'col_start': 0,
                     'col_end': df.width - 1,
@@ -564,15 +542,10 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
                         tables[0]['header_cols']['dob'] = [df.columns[i] for i in dob_idx] if dob_idx else []
                         tables[0]['header_cols']['policynum'] = [df.columns[i] for i in pol_idx] if pol_idx else []
                     else:
-                        write_log_row(job, {
-                            'File Path': file_path, 'File Name': file_name,
-                            'Sheet Name': sheet_name,
-                            'Error Msg': 'No identifiable headers or content patterns',
-                            'Remarks': ''
-                        })
+                        log_error(job, file_path, file_name, Exception("No identifiable headers or content patterns"),
+                                  sheet_name=sheet_name)
                         continue
 
-            # Process each table
             for table_idx, table in enumerate(tables):
                 col_start = table['col_start']
                 col_end = table['col_end']
@@ -580,30 +553,23 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
                 header_cols = table['header_cols']
                 identified = table.get('identified_headers', [])
 
-                # Slice the table
                 if col_start == 0 and col_end == df.width - 1:
                     table_df = df
                 else:
                     table_df = df[:, col_start:col_end+1]
 
-                # Prepare column names from header values
                 name_cols_raw = header_cols['name']
                 firstlast_cols_raw = header_cols['firstlastname']
                 sex_cols_raw = header_cols['sex']
                 dob_cols_raw = header_cols['dob']
                 pol_cols_raw = header_cols['policynum']
 
-                # ---------- RENAME COLUMNS IF HEADER FOUND ----------
                 if hdr_idx_rel >= 0:
-                    # Save the original header values before renaming
                     original_header_vals = [str(v) if v is not None else '' for v in table_df.row(hdr_idx_rel)]
                     table_df = rename_columns_with_header(table_df, hdr_idx_rel)
-                    # Map raw column names to new unique column names
                     def map_to_new_names(raw_names):
                         new = []
                         for raw in raw_names:
-                            # The raw name came from the header row; find which new column corresponds to it
-                            # Since renaming preserved order, we can match by index: find indices of raw in original_header_vals
                             indices = [i for i, oh in enumerate(original_header_vals) if oh == raw]
                             for idx in indices:
                                 new.append(table_df.columns[idx])
@@ -613,7 +579,7 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
                     sex_cols = map_to_new_names(sex_cols_raw)
                     dob_cols = map_to_new_names(dob_cols_raw)
                     pol_cols = map_to_new_names(pol_cols_raw)
-                    hdr_idx_rel = -1  # No header row remaining
+                    hdr_idx_rel = -1
                 else:
                     name_cols = name_cols_raw
                     firstlast_cols = firstlast_cols_raw
@@ -621,26 +587,16 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
                     dob_cols = dob_cols_raw
                     pol_cols = pol_cols_raw
 
-                # ---------- NUMERIC FILTER (NOW ON RENAMED COLUMNS) ----------
                 name_cols = filter_numeric_columns(table_df, name_cols)
                 firstlast_cols = filter_numeric_columns(table_df, firstlast_cols)
 
-                # ---------- BUILD OUTPUT ----------
                 table_sheet_name = f"{sheet_name}_table{table_idx+1}" if len(tables) > 1 else sheet_name
                 remarks = []
 
-                if hdr_idx_rel >= 0:
-                    # This shouldn't happen after renaming, but just in case
-                    output_df, missing_name = build_output_df_safe(
-                        table_df, hdr_idx_rel, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
-                        file_path, table_sheet_name, job.company_code)
-                else:
-                    # Use the safe builder (which handles multi‑name for headerless? No,
-                    # but multi‑name is in build_output_df, not in build_output_df_safe.
-                    # So we call build_output_df_safe with hdr_idx=-1, which now avoids slicing.
-                    output_df, missing_name = build_output_df_safe(
-                        table_df, -1, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
-                        file_path, table_sheet_name, job.company_code)
+                # [PATCH 2] Now using build_output_df (multi-name support) for Excel
+                output_df, missing_name = build_output_df(
+                    table_df, -1, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
+                    file_path, table_sheet_name, job.company_code)
 
                 remarks.append(f"Missing name rows: {missing_name}")
                 before_filter = output_df.height
@@ -649,15 +605,11 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
                 remarks.append(f"Rows before filter: {before_filter}, after: {after_filter}")
 
                 if output_df.is_empty():
-                    write_log_row(job, {
-                        'File Path': file_path, 'File Name': file_name,
-                        'Sheet Name': table_sheet_name,
-                        'Error Msg': 'All rows filtered out (age/duplicates)',
-                        'Remarks': '; '.join(remarks)
-                    })
+                    log_error(job, file_path, file_name,
+                              Exception(f"All rows filtered out: {remarks}"),
+                              sheet_name=table_sheet_name)
                     continue
 
-                # CSV splitting
                 max_rows = MAX_ROWS_PER_OUTPUT_CSV if MAX_ROWS_PER_OUTPUT_CSV > 0 else output_df.height
                 part = 1
                 chunk_start = 0
@@ -695,13 +647,13 @@ def process_excel_file_standard(job, file_path, file_name, company_headers, pass
                     part += 1
 
     except Exception as e:
-        write_log_row(job, {'File Path': file_path, 'File Name': file_name, 'Error Msg': str(e)})
+        log_error(job, file_path, file_name, e)
 
-# --- Chunked processing disabled ---
+# --- Chunked Excel (disabled) ---
 def process_excel_chunked(job, file_path, file_name, company_headers, password):
-    raise NotImplementedError("Chunked Excel processing requires implementation of extract_table_data_from_chunk.")
+    raise NotImplementedError("Chunked Excel processing requires implementation.")
 
-# ==================== TEXT FILE PROCESSING (RESTORED WITH FIX) ====================
+# ==================== TEXT FILE PROCESSING (WITH ALL PATCHES) ====================
 def process_text_file(job, file_path, file_name, company_headers):
     try:
         with open(file_path, 'rb') as f:
@@ -720,7 +672,6 @@ def process_text_file(job, file_path, file_name, company_headers):
             hdr_idx, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols, identified = \
                 detect_header_row_and_columns(sample_df, company_headers)
             if hdr_idx is not None:
-                # Rename columns first, then numeric filter
                 df = rename_columns_with_header(df, hdr_idx)
                 name_cols = filter_numeric_columns(df, name_cols)
                 firstlast_cols = filter_numeric_columns(df, firstlast_cols)
@@ -730,21 +681,16 @@ def process_text_file(job, file_path, file_name, company_headers):
                     file_path, '', job.company_code)
                 remarks.append(f"Missing name rows: {missing_name}")
                 output_df = filter_duplicates_only(output_df)
-                # ... rest same (splitting, logging) ...
                 if not output_df.is_empty():
                     max_rows = MAX_ROWS_PER_OUTPUT_CSV if MAX_ROWS_PER_OUTPUT_CSV > 0 else output_df.height
                     part = 1
                     chunk_start = 0
-                    out_rows = output_df.height
-                    first_out_path = None
                     while chunk_start < output_df.height:
                         chunk = output_df.slice(chunk_start, max_rows)
                         out_path = get_unique_save_path(
                             os.path.join(job.csv_folder, f"{file_name}_part{part}_OFAC_OUTPUT.csv")
                         )
                         chunk.write_csv(out_path)
-                        if part == 1:
-                            first_out_path = out_path
                         row_dict = {
                             'File Path': file_path, 'File Name': file_name, 'Scan Date': job.today,
                             'Extension': os.path.splitext(file_name)[1].replace('.',''),
@@ -765,23 +711,57 @@ def process_text_file(job, file_path, file_name, company_headers):
                         write_log_row(job, row_dict)
                         chunk_start += max_rows
                         part += 1
-                else:
-                    out_path, out_rows = None, 0
             else:
-                # Header not found – log error
-                row_dict = {
-                    'File Path': file_path, 'File Name': file_name, 'Scan Date': job.today,
-                    'Extension': os.path.splitext(file_name)[1].replace('.',''),
-                    'Company Code': job.company_code,
-                    'Sheet Name': '',
-                    'Error Msg': 'No identifiable headers found',
-                    'Output Row Count': 0,
-                    'Remarks': '; '.join(remarks)
-                }
-                write_log_row(job, row_dict)
+                # [PATCH 4] Content-based fallback for text files without header
+                name_idx, firstlast_idx, sex_idx, dob_idx, pol_idx = detect_columns_by_content(df)
+                if name_idx or firstlast_idx:
+                    name_cols = [df.columns[i] for i in name_idx]
+                    firstlast_cols = [df.columns[i] for i in firstlast_idx]
+                    sex_cols = [df.columns[i] for i in sex_idx]
+                    dob_cols = [df.columns[i] for i in dob_idx]
+                    pol_cols = [df.columns[i] for i in pol_idx]
 
+                    output_df, missing_name = build_output_df(
+                        df, -1, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
+                        file_path, '', job.company_code)
+                    remarks.append(f"Missing name rows: {missing_name}")
+                    output_df = filter_duplicates_only(output_df)
+
+                    if not output_df.is_empty():
+                        max_rows = MAX_ROWS_PER_OUTPUT_CSV if MAX_ROWS_PER_OUTPUT_CSV > 0 else output_df.height
+                        part = 1
+                        chunk_start = 0
+                        while chunk_start < output_df.height:
+                            chunk = output_df.slice(chunk_start, max_rows)
+                            out_path = get_unique_save_path(
+                                os.path.join(job.csv_folder, f"{file_name}_part{part}_OFAC_OUTPUT.csv")
+                            )
+                            chunk.write_csv(out_path)
+                            row_dict = {
+                                'File Path': file_path, 'File Name': file_name, 'Scan Date': job.today,
+                                'Extension': os.path.splitext(file_name)[1].replace('.',''),
+                                'Company Code': job.company_code,
+                                'Sheet Name': f"part{part}" if max_rows < output_df.height else '',
+                                'Identified Headers': 'Content-based',
+                                'Multiple Name': (len(name_cols) >= 2 or len(firstlast_cols) > 2),
+                                'Row Count': df.height,
+                                'Output Row Count': chunk.height,
+                                'Output CSV': out_path,
+                                'First Last Name Header': ', '.join(firstlast_cols) if firstlast_cols else None,
+                                'Full Name Header': ', '.join(name_cols) if name_cols else None,
+                                'Policy Number Header': pol_cols[0] if pol_cols else None,
+                                'DOB Header': dob_cols[0] if dob_cols else None,
+                                'Sex Header': sex_cols[0] if sex_cols else None,
+                                'Remarks': '; '.join(remarks) + (f' (part {part})' if max_rows < output_df.height else '')
+                            }
+                            write_log_row(job, row_dict)
+                            chunk_start += max_rows
+                            part += 1
+                else:
+                    log_error(job, file_path, file_name,
+                              Exception("No identifiable headers or content patterns found"))
         else:
-            # Large file processing with batching – updated to rename first batch and use -1 for others
+            # [PATCH 1] Large file – batched reading with column name propagation
             reader = pl.read_csv_batched(file_path, has_header=False, encoding=enc,
                                          separator=delim, quote_char=quote, batch_size=CHUNK_SIZE)
             first_batch = reader.next_batches(1)[0]
@@ -790,15 +770,11 @@ def process_text_file(job, file_path, file_name, company_headers):
                 detect_header_row_and_columns(sample_df, company_headers)
 
             if hdr_idx is None:
-                write_log_row(job, {
-                    'File Path': file_path, 'File Name': file_name,
-                    'Error Msg': 'No identifiable headers found in large file',
-                    'Remarks': 'Header match failed'
-                })
+                log_error(job, file_path, file_name, Exception("No identifiable headers in large file"))
                 return
 
-            # Rename first batch and apply numeric filter
             first_batch = rename_columns_with_header(first_batch, hdr_idx)
+            renamed_col_names = first_batch.columns   # save the new column names
             name_cols = filter_numeric_columns(first_batch, name_cols)
             firstlast_cols = filter_numeric_columns(first_batch, firstlast_cols)
 
@@ -812,6 +788,8 @@ def process_text_file(job, file_path, file_name, company_headers):
 
             def process_one_batch(batch_df):
                 nonlocal total_out_rows, total_missing_name, part, current_part_rows, current_chunk_df, first_out_path
+                # Apply the exact same column names to every batch
+                batch_df.columns = renamed_col_names
                 output_df, missing_name = build_output_df(
                     batch_df, -1, name_cols, firstlast_cols, sex_cols, dob_cols, pol_cols,
                     file_path, '', job.company_code)
@@ -894,9 +872,9 @@ def process_text_file(job, file_path, file_name, company_headers):
                 })
 
     except Exception as e:
-        write_log_row(job, {'File Path': file_path, 'File Name': file_name, 'Error Msg': str(e)})
+        log_error(job, file_path, file_name, e)
 
-# ==================== ARCHIVE, LOGGING, COMPILATION, WATCHER (UNCHANGED) ====================
+# ==================== ARCHIVE, LOGGING, COMPILATION, WATCHER ====================
 def process_archive_file(job, archive_path, archive_name):
     extracted_files = []
     try:
@@ -939,6 +917,17 @@ def write_log_row(job, row_dict):
     except Exception as e:
         print(f"Failed to write log: {e}")
 
+# [PATCH 10] Better error logging helper
+def log_error(job, file_path, file_name, exception, sheet_name='', extra_remarks=''):
+    tb = traceback.format_exc()
+    write_log_row(job, {
+        'File Path': file_path,
+        'File Name': file_name,
+        'Sheet Name': sheet_name,
+        'Error Msg': f"{type(exception).__name__}: {exception}",
+        'Remarks': f"{extra_remarks} | Traceback (last 5 calls):\n{tb[-2000:]}"  # truncated to avoid huge logs
+    })
+
 def compile_outputs(job):
     if not os.path.exists(job.log_file):
         return
@@ -960,6 +949,8 @@ def compile_outputs(job):
         except (ValueError, TypeError):
             continue
         if compiled_row_count + out_rows > EXCEL_MAX_ROWS and not current_df.is_empty():
+            # [PATCH 8] Cross‑file deduplication before writing
+            current_df = current_df.unique()
             out_path = get_unique_save_path(f"{base_out}_{file_idx}.xlsx")
             current_df.write_excel(out_path)
             output_files.append(out_path)
@@ -974,6 +965,8 @@ def compile_outputs(job):
         except Exception as e:
             print(f"Error reading {csv_path}: {e}")
     if not current_df.is_empty():
+        # [PATCH 8] Deduplication for final chunk
+        current_df = current_df.unique()
         out_path = get_unique_save_path(f"{base_out}_{file_idx}.xlsx")
         current_df.write_excel(out_path)
         output_files.append(out_path)
@@ -998,20 +991,20 @@ def process_files_direct(job, progress_callback=None, stop_flag=None, progress_u
         file_name = os.path.basename(src_path)
         if progress_callback:
             progress_callback(f"Processing {file_name}...")
-        try:
-            archived_path = move_file_to_archived(src_path, job.archived_folder)
-        except Exception as e:
-            write_log_row(job, {'File Path': src_path, 'File Name': file_name, 'Error Msg': str(e)})
-            idx += 1
-            continue
         ext = os.path.splitext(file_name)[1].lower().replace('.', '')
-        if ext in FILE_EXTENSIONS_EXCEL:
-            process_excel_file(job, archived_path, file_name, company_headers)
-        elif ext in FILE_EXTENSIONS_TEXT:
-            process_text_file(job, archived_path, file_name, company_headers)
-        elif ext in FILE_EXTENSIONS_ARCHIVE:
-            new_files = process_archive_file(job, archived_path, file_name)
-            all_file_paths.extend(new_files)
+        # [PATCH 6] Process first, then archive only on success
+        try:
+            if ext in FILE_EXTENSIONS_EXCEL:
+                process_excel_file(job, src_path, file_name, company_headers)
+            elif ext in FILE_EXTENSIONS_TEXT:
+                process_text_file(job, src_path, file_name, company_headers)
+            elif ext in FILE_EXTENSIONS_ARCHIVE:
+                new_files = process_archive_file(job, src_path, file_name)
+                all_file_paths.extend(new_files)
+            # Move to archive only after successful processing
+            move_file_to_archived(src_path, job.archived_folder)
+        except Exception as e:
+            log_error(job, src_path, file_name, e)
         idx += 1
     compile_outputs(job)
     return True
@@ -1033,7 +1026,7 @@ def process_excel_file(job, file_path, file_name, company_headers):
         else:
             process_excel_file_standard(job, actual_path, file_name, company_headers, password)
     except Exception as e:
-        write_log_row(job, {'File Path': file_path, 'File Name': file_name, 'Error Msg': str(e)})
+        log_error(job, file_path, file_name, e)
     finally:
         if temp_path:
             try:
@@ -1041,7 +1034,7 @@ def process_excel_file(job, file_path, file_name, company_headers):
             except:
                 pass
 
-# ==================== TABLE DETECTION & SHIFT ADJUSTMENT (ORIGINAL) ====================
+# ==================== TABLE DETECTION & SHIFT ADJUSTMENT ====================
 def is_empty_cell(val):
     if val is None:
         return True
@@ -1061,8 +1054,6 @@ def find_non_empty_columns(df_sample, max_rows=10):
     return sorted(non_empty)
 
 def detect_tables_in_sheet(df_sample, company_headers, max_search_rows):
-    """Scan for multiple tables in one sheet by column clusters.
-    Returns column names (header cell values) for each category."""
     tables = []
     non_empty_cols = find_non_empty_columns(df_sample, max_rows=10)
     if not non_empty_cols:
@@ -1118,11 +1109,10 @@ def detect_tables_in_sheet(df_sample, company_headers, max_search_rows):
                     },
                     'identified_headers': list(row_vals)
                 })
-                break   # only one header per cluster
+                break
     return tables
 
 def adjust_for_shifts(df, table_info):
-    # (original code kept for potential future use, but no longer called in the new flow)
     header_row = table_info['header_row_idx']
     col_start = table_info['col_start']
     col_end = table_info['col_end']
@@ -1174,7 +1164,7 @@ def unlock_excel(file_path, passwords):
                 continue
         raise ValueError(f"Could not decrypt {file_path} with any password")
 
-# ==================== WATCHER ====================
+# ==================== WATCHER (unchanged) ====================
 class FolderHandler(FileSystemEventHandler):
     def __init__(self, watch_path):
         self.watch_path = watch_path
